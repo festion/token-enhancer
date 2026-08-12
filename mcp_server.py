@@ -36,6 +36,7 @@ if _missing:
 import functools
 import anyio
 from mcp.server.fastmcp import FastMCP
+from data_proxy import _EXTRACTION_FAILED as EXTRACTION_FAILED
 from data_proxy import fetch_and_clean, init_data_db
 from optimizer import optimize_prompt
 from url_validator import validate_batch, URLValidationError
@@ -44,7 +45,7 @@ mcp = FastMCP("token-enhancer")
 
 
 @mcp.tool()
-async def fetch_clean(url: str, ttl: int = 300) -> str:
+async def fetch_clean(url: str, ttl: int = 300, no_cache: bool = False) -> str:
     """Fetch a URL and return clean text with all HTML noise removed.
     Strips navigation, ads, scripts, styles, and boilerplate.
     Caches results to avoid redundant fetches.
@@ -52,9 +53,12 @@ async def fetch_clean(url: str, ttl: int = 300) -> str:
 
     Args:
         url: The URL to fetch and clean
-        ttl: Cache duration in seconds (default 300)
+        ttl: How long to STORE the result, in seconds (default 300). This is not
+             a freshness bound — it will not force a re-fetch. Use no_cache.
+        no_cache: Skip the cache in both directions and fetch fresh.
     """
-    result = await anyio.to_thread.run_sync(functools.partial(fetch_and_clean, url, ttl))
+    result = await anyio.to_thread.run_sync(
+        functools.partial(fetch_and_clean, url, ttl, no_cache))
 
     if result.error:
         raise RuntimeError(f"Error fetching {url}: {result.error}")
@@ -74,13 +78,16 @@ async def fetch_clean(url: str, ttl: int = 300) -> str:
 
 
 @mcp.tool()
-async def fetch_clean_batch(urls: list[str], ttl: int = 300) -> str:
+async def fetch_clean_batch(urls: list[str], ttl: int = 300,
+                            no_cache: bool = False) -> str:
     """Fetch multiple URLs and return clean text for each.
     Each URL is stripped of HTML noise and cached independently.
 
     Args:
         urls: List of URLs to fetch and clean
-        ttl: Cache duration in seconds (default 300)
+        ttl: How long to STORE each result, in seconds (default 300). Not a
+             freshness bound — use no_cache to force a re-fetch.
+        no_cache: Skip the cache in both directions and fetch every URL fresh.
     """
     try:
         validate_batch(urls)
@@ -88,14 +95,24 @@ async def fetch_clean_batch(urls: list[str], ttl: int = 300) -> str:
         raise RuntimeError(str(e))
 
     results = []
+    failures = []
     total_original = 0
     total_cleaned = 0
 
     for url in urls:
-        r = await anyio.to_thread.run_sync(functools.partial(fetch_and_clean, url, ttl))
+        r = await anyio.to_thread.run_sync(
+            functools.partial(fetch_and_clean, url, ttl, no_cache))
         total_original += r.original_tokens
         total_cleaned += r.cleaned_tokens
 
+        # A destroyed extraction does not abort the batch — losing four good
+        # fetches to one bad page helps nobody. It is rendered in place instead,
+        # where the reader is already looking. A transport error still raises,
+        # which is the pre-existing contract.
+        if r.content_type == EXTRACTION_FAILED:
+            failures.append(url)
+            results.append(f"--- {url} ---\n[EXTRACTION FAILED] {r.error}\n")
+            continue
         if r.error:
             raise RuntimeError(f"Error fetching {url}: {r.error}")
         results.append(f"--- {url} ---\n{r.content}\n")
@@ -106,10 +123,19 @@ async def fetch_clean_batch(urls: list[str], ttl: int = 300) -> str:
 
     header = (
         f"[Token Enhancer] {len(urls)} URLs | "
-        f"{total_original:,} -> {total_cleaned:,} tokens ({reduction}% reduced)\n\n"
+        f"{total_original:,} -> {total_cleaned:,} tokens ({reduction}% reduced)\n"
     )
+    # The batch total AVERAGES a per-URL total loss away: four good fetches and
+    # one destroyed one still report a healthy-looking aggregate, and the empty
+    # section is easy to read as "that page had nothing on it". State it in the
+    # header, where the reader looks first, rather than leaving it to be noticed.
+    if failures:
+        header += (
+            f"⚠ {len(failures)} of {len(urls)} produced NO content — the aggregate "
+            f"above averages that away: {', '.join(failures)}\n"
+        )
 
-    return header + "\n".join(results)
+    return header + "\n" + "\n".join(results)
 
 
 @mcp.tool()

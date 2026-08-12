@@ -211,8 +211,44 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def fetch_and_clean(url: str, ttl: int = 300) -> DataResult:
-    """Fetch a URL, clean it, cache it, return clean content."""
+# A cleaner that consumes every byte of a non-empty page has FAILED; it has not
+# achieved a 100% reduction. The success metric is inverted at its own limit:
+# "99.2% reduced" is the tool working well and "100.0% reduced" is total content
+# loss, and the two render in identical, green-sounding phrasing.
+#
+# Measured 2026-08-12 against the live tool:
+#   fetch_clean("https://github.com/orgs/community/discussions/36441")
+#     -> "[Token Enhancer] 454,527 -> 1 tokens (100.0% reduced)"   error=''
+#     -> body: ''                                                  from_cache=False
+# A plain curl of the same URL returns 1,818,737 bytes with 109 parseable comment
+# ids, so the FETCH succeeded and the EXTRACTOR destroyed everything.
+#
+# The caller receives an empty string rather than an error, so "this page has no
+# content" and "extraction failed" are indistinguishable. The dangerous direction
+# is summarising from it: an agent that fetched a page, got an empty body and
+# reported "the thread contains nothing relevant" would be stating a measurement
+# it never made. It was caught here only because the byte count in the tool's own
+# success message was implausibly large for an empty result.
+#
+# Note estimate_tokens("") is 1, not 0 (`max(1, ...)`), which is why the header
+# reads "-> 1 tokens". So the test has to be on the CONTENT being empty; a
+# cleaned_tokens == 0 check would never fire.
+_EXTRACTION_FAILED = "extraction_failed"
+
+
+def _extraction_destroyed_everything(raw: str, cleaned: str) -> bool:
+    """True when a non-empty fetch produced nothing at all."""
+    return bool(raw.strip()) and not cleaned.strip()
+
+
+def fetch_and_clean(url: str, ttl: int = 300, no_cache: bool = False) -> DataResult:
+    """Fetch a URL, clean it, cache it, return clean content.
+
+    *no_cache* bypasses the cache in both directions — read and write. `ttl` sets
+    how long an entry is STORED, not how fresh a read must be, so `ttl=1` does not
+    force a re-fetch (measured: the second call still returned [cached]). There
+    was previously no way to force one except varying the URL.
+    """
 
     # Validate URL before doing anything (SSRF protection)
     try:
@@ -228,7 +264,7 @@ def fetch_and_clean(url: str, ttl: int = 300) -> DataResult:
         )
 
     # Check cache first
-    cached = cache_get(url)
+    cached = None if no_cache else cache_get(url)
     if cached:
         log_fetch(url, cached["original_tokens"],
                   cached["cleaned_tokens"], from_cache=True)
@@ -282,8 +318,34 @@ def fetch_and_clean(url: str, ttl: int = 300) -> DataResult:
 
     cleaned_tokens = estimate_tokens(cleaned)
 
+    if _extraction_destroyed_everything(raw, cleaned):
+        # Fail loudly, and do NOT cache. Caching a destroyed extraction poisons
+        # every call for the whole TTL, so the one reproducible symptom — an
+        # implausibly large "original" against an empty body — disappears behind
+        # a [cached] marker on the retry that would have exposed it.
+        #
+        # Reported as an error rather than falling back to the raw text: this
+        # fires precisely on the pages where the raw is enormous (454k tokens in
+        # the measured case), so a silent fallback would swap total content loss
+        # for a context blowout. The message states the fetch succeeded and names
+        # the size, so the reader knows to reach for WebFetch rather than retry.
+        error = (
+            f"extraction produced no content from a {len(raw):,}-byte "
+            f"({original_tokens:,}-token) {ctype} response. The FETCH succeeded; "
+            f"the cleaner destroyed all of it. This is not a 100% reduction. "
+            f"Use WebFetch for this URL."
+        )
+        log_fetch(url, original_tokens, 0, from_cache=False, error=error)
+        return DataResult(
+            url=url, original_size=len(raw), cleaned_size=0,
+            original_tokens=original_tokens, cleaned_tokens=0,
+            from_cache=False, content="", content_type=_EXTRACTION_FAILED,
+            error=error,
+        )
+
     # Cache it
-    cache_set(url, cleaned, original_tokens, cleaned_tokens, ttl)
+    if not no_cache:
+        cache_set(url, cleaned, original_tokens, cleaned_tokens, ttl)
 
     # Log it
     log_fetch(url, original_tokens, cleaned_tokens, from_cache=False)
