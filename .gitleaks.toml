@@ -1,0 +1,222 @@
+# Shared gitleaks config for the homelab monorepo.
+#
+# Companion to: operations/docs/plans/2026-05-08-monorepo-security-remediation.md
+# Author: Task 22 (Vikunja #1073).
+#
+# Each repo's `.gitleaks.toml` is a verbatim copy of this file.
+# To update centrally: edit `operations/templates/gitleaks/.gitleaks.toml`,
+# then re-roll via the per-repo procedure in the README.
+#
+# Rule shapes are tuned to the literals found in the 2026-05-08 audit:
+#   - HA long-lived JWTs (eyJ... with iss/iat/exp claims)
+#   - Proxmox / PBS API tokens (`PVEAPIToken=…`, `PBSAPIToken=…`)
+#   - NetBox 40-char hex tokens
+#   - Pushover app/user tokens (30-char alnum)
+#   - TrueNAS API keys (numeric-id-prefixed: `<id>-<base64ish>`)
+#   - generic JWT shape, PEM private keys, AWS keys
+
+title = "Homelab monorepo gitleaks config"
+
+[extend]
+# Pull in gitleaks' upstream defaults (covers AWS, GCP, Stripe, etc.).
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Custom rules
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "ha-long-lived-token"
+description = "Home Assistant long-lived access token (JWT with iss claim)"
+# JWTs are header.payload.signature, all base64url. The HA-specific tells are
+# `iss`, `iat`, `exp` claims after a permissive header. Keep the regex narrow
+# enough that arbitrary base64 blobs don't trip it.
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{20,}'''
+keywords = ["eyJ"]
+
+[[rules]]
+id = "proxmox-pve-api-token"
+description = "Proxmox VE API token (`PVEAPIToken=user@realm!tokenid=uuid`)"
+# Token format: PVEAPIToken=user@realm!tokenid=<uuid-secret>
+regex = '''PVEAPIToken=[A-Za-z0-9._@-]+![A-Za-z0-9._-]+=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+keywords = ["PVEAPIToken="]
+
+[[rules]]
+id = "pbs-api-token"
+description = "Proxmox Backup Server API token (`PBSAPIToken=user@realm!tokenid:uuid`)"
+# PBS uses `:` as the separator between tokenid and secret (PVE uses `=`).
+regex = '''PBSAPIToken=[A-Za-z0-9._@-]+![A-Za-z0-9._-]+:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+keywords = ["PBSAPIToken="]
+
+[[rules]]
+id = "pbs-token-id-with-uuid-secret"
+description = "PBS token id with adjacent UUID secret (`monitor@pbs!name:uuid` shape)"
+# Catches the bare-token shape that appeared in proxmox-agent docs / configs:
+#   monitor@pbs!agent:8a14ef79-1a2b-4c5d-...
+# Matches @pbs! plus a UUID v4 within ~80 chars.
+regex = '''[A-Za-z0-9._-]+@pbs![A-Za-z0-9._-]+[:= ]\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+keywords = ["@pbs!"]
+
+[[rules]]
+id = "pve-token-id-with-uuid-secret"
+description = "PVE token id with adjacent UUID secret (`api@pve!homepage=uuid` shape)"
+regex = '''[A-Za-z0-9._-]+@pve![A-Za-z0-9._-]+[:= ]\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+keywords = ["@pve!"]
+
+[[rules]]
+id = "netbox-api-token"
+description = "NetBox API token (40 hex chars, often after `Token ` or in a config field)"
+# NetBox tokens are 40 lowercase-hex. Require an anchor word to keep noise low.
+regex = '''(?i)(netbox[_-]?(api[_-]?)?token|netbox.*authorization)["'\s:=]+[a-f0-9]{40}\b'''
+keywords = ["netbox"]
+
+[[rules]]
+id = "pushover-app-token"
+description = "Pushover application token (30-char alnum, prefixed with `a`)"
+# Pushover app tokens start with 'a' and are 30 chars total. User keys start
+# with 'u' and are also 30 chars. Anchor on the keyword to avoid noise.
+regex = '''(?i)(pushover[_-]?(api[_-]?)?(token|key))["'\s:=]+[aug][a-zA-Z0-9]{29}\b'''
+keywords = ["pushover"]
+
+[[rules]]
+id = "truenas-api-key"
+description = "TrueNAS API key (id-prefixed: `<n>-<60+ alnum>`)"
+# Format: `<numeric_id>-<base64ish-60-chars>`. Anchor on context so we don't
+# false-positive on every dashed identifier.
+regex = '''(?i)(truenas[_-]?(api[_-]?)?key|HOMEPAGE_VAR_TRUENAS_KEY)["'\s:=]+[0-9]+-[A-Za-z0-9]{60,}\b'''
+keywords = ["truenas", "HOMEPAGE_VAR_TRUENAS_KEY"]
+
+[[rules]]
+id = "private-key-pem"
+description = "Private key PEM block (RSA, EC, OpenSSH, generic)"
+regex = '''-----BEGIN ((RSA|EC|DSA|OPENSSH|PGP) )?PRIVATE KEY( BLOCK)?-----'''
+keywords = ["BEGIN", "PRIVATE KEY"]
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key (`sk-ant-api03-…` and similar version prefixes)"
+# Format: `sk-ant-api<N>-` then ~95 chars base64url. Self-anchored — no
+# keyword needed; the prefix is unique enough not to false-positive.
+regex = '''sk-ant-api\d{2,}-[A-Za-z0-9_-]{90,}'''
+keywords = ["sk-ant-api"]
+
+[[rules]]
+id = "generic-bearer-token"
+description = "Generic bearer / authorization with long secret"
+# Loose match for `Authorization: Bearer <60+ chars>` or `auth_token = <secret>`.
+# `\b` prefix prevents matches on camelCase identifiers like `authenticateApiKey`
+# (no word boundary inside camelCase). Keyword list reduces noise further.
+regex = '''(?i)\b(authorization|bearer|api[_-]?token|api[_-]?key|access[_-]?token)["'\s:=]+[A-Za-z0-9._\-]{40,}\b'''
+keywords = ["authorization", "bearer", "api_token", "api-token", "apikey", "api_key", "access_token"]
+
+# ---------------------------------------------------------------------------
+# Allowlist
+# ---------------------------------------------------------------------------
+#
+# Per-line opt-out: append `# gitleaks:allow` to a line to silence ALL rules
+# on that single line. Use sparingly and ALWAYS leave a comment explaining why
+# the match is a false positive (e.g. test fixture, public sample, doc example).
+#
+# Path-level opt-outs go below.
+
+[allowlist]
+description = "Global allowlist for known-safe paths and test fixtures"
+
+# Files that cannot meaningfully contain secrets but trigger heuristics.
+# Path regexes match against the file path *relative to the repo root*.
+paths = [
+  '''(?i)(^|/)CHANGELOG(\.md)?$''',
+  '''(?i)(^|/)LICENSE(\.md|\.txt)?$''',
+  '''(?i)(^|/)\.gitleaks\.toml$''',
+  '''(?i)(^|/)\.gitleaksignore$''',
+  '''(?i)(^|/)go\.sum$''',
+  '''(?i)(^|/)package-lock\.json$''',
+  '''(?i)(^|/)pnpm-lock\.yaml$''',
+  '''(?i)(^|/)yarn\.lock$''',
+  '''(?i)(^|/)poetry\.lock$''',
+  '''(?i)(^|/)Pipfile\.lock$''',
+  '''(?i)(^|/)uv\.lock$''',
+  # The gitleaks template itself contains rule regexes that would self-match.
+  '''(?i)(^|/)templates/gitleaks/''',
+  # Heavy gitignored dirs that bypass-scans (`gitleaks detect --no-git
+  # --source .`) would otherwise traverse. The pre-commit hook never sees
+  # these files (gitignored = never staged), so allowlisting here keeps
+  # ad-hoc baseline scans noise-free without weakening commit-time defense.
+  '''(^|/)\.serena/cache/''',
+  '''(^|/)\.serena/memories/.*/cache/''',
+  '''(^|/)\.storage/''',                       # Home Assistant runtime store
+  '''(^|/)\.esphome/''',                       # ESPHome build cache
+  '''(^|/)esphome/\.esphome/''',
+  '''(^|/)esphome/build/''',
+  '''(^|/)secrets\.yaml$''',                   # local-only HA secrets file (gitignored)
+  '''(^|/)secrets\.yml$''',
+  '''(^|/)\.env$''',                           # gitignored env files; never staged
+  '''(^|/)\.env\.(local|prod|production|development|dev|staging|test)$''',
+  # Template / example env files — inherently full of placeholders.
+  # `.env.example`, `.env.sample`, `.env.template` etc.
+  '''(^|/)\.env\.(template|example|sample|dist|defaults?)$''',
+  # Test directories — fixtures inevitably carry token-shaped strings.
+  '''(^|/)tests?/''',
+  '''(^|/)__tests__/''',
+  '''(^|/)spec/''',
+  '''(^|/)\.jest-cache[^/]*/''',                # Jest transform / haste-map caches
+  '''\.pkl$''',                                # pickle binaries (Serena)
+  '''\.log$''',                                # log files
+  '''(^|/)home-assistant\.log''',
+  '''(^|/)dist/''',                            # built artifacts
+  '''(^|/)build/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)__pycache__/''',
+  '''\.pyc$''',
+]
+
+# Stop matches that are obviously placeholder / docs / test fixtures.
+# Each entry is a regex that, if it matches the LINE (not just the match),
+# suppresses the finding.
+regexes = [
+  # Test-fixture UUIDs (zero-uuid, all-f-uuid).
+  '''00000000-0000-0000-0000-000000000000''',
+  '''ffffffff-ffff-ffff-ffff-ffffffffffff''',
+  # Common doc placeholders.
+  '''(?i)<your[_-]?(token|key|password|secret)>''',
+  '''(?i)REPLACE[_-]?ME''',
+  '''(?i)example[_-]?(token|key|secret)''',
+  '''xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx''',
+  # Bare upper-snake placeholder words used in shell/curl examples
+  # ("Authorization: Token YOUR_TOKEN" etc.). `_HERE` and `_<vendor>_<TYPE>`
+  # tails are common (YOUR_TOKEN_HERE, YOUR_WIKIJS_TOKEN, YOUR_CLOUDFLARE_KEY).
+  '''\bYOUR_(TOKEN|KEY|API_KEY|API_TOKEN|PASSWORD|SECRET|ACCESS_TOKEN)(_HERE|_VALUE)?\b''',
+  '''\bYOUR_[A-Z][A-Z0-9_]+(_TOKEN|_KEY|_PASSWORD|_SECRET)\b''',
+  '''\b(MY_|FAKE_|DUMMY_|PLACEHOLDER_|TEST_|EXAMPLE_)(TOKEN|KEY|API_KEY|PASSWORD|SECRET)\b''',
+  # Bare `PASSWORD` / `TOKEN` etc. in shell-quoted creds: `-u "root:PASSWORD"`.
+  '''[':"]\s*(USERNAME|USER|PASSWORD|PASS|TOKEN|KEY|SECRET)\s*[':"]''',
+  # Truncated-with-ellipsis JWT/Infisical placeholders in docs.
+  # `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` — canonical HS256 JWT header,
+  # ellipsis-truncated. Same pattern handles other JWT placeholders.
+  '''eyJ[A-Za-z0-9_-]+\.\.\.''',
+  # `eyJ...` JWTs with `alg:none` test fixtures (3 dots literal then trailing).
+  '''eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.\s*['"]''',
+  # Infisical service token placeholder (`st.<uuid>...` or `st.your-token`).
+  '''st\.[0-9a-f-]{0,36}\.\.\.''',
+  '''st\.your-token''',
+  '''st\.<[^>]+>''',
+  # Sequential-digit GitHub PAT placeholder (`ghp_1234567890abcdef...`).
+  '''ghp_1234567890[a-f0-9]+''',
+  # Cloudflare token placeholder shape used by Traefik docs.
+  '''hga_your_api_key_here''',
+  # Documented example curl credentials — weak placeholder passwords in docs
+  # (`curl -u admin:proxmox123`, `root:changeme`). Never real; a genuine
+  # leaked cred would not be one of these throwaway example values. (#1999)
+  '''(?i)\b(admin|root|user):(proxmox123|password|passwd|changeme|example|placeholder|test)\b''',
+  # Stripe-style placeholder API keys in docs (`sk_live_abc123...`,
+  # `sk_test_...`). Real Stripe keys are 24+ random chars with no
+  # `abc123`/ellipsis tell. (#1999)
+  '''sk_(live|test)_[A-Za-z0-9]*\.\.\.''',
+  '''sk_(live|test)_(abc123|xxx|placeholder|example|your)[A-Za-z0-9]*''',
+  # Angle-bracket placeholders standardized in our 2026-05-08 rotation work.
+  # Catches `<OLD_…>`, `<NEW_…>`, `<SEE_INFISICAL:…>`, `<LAKEHOUSE_…>`,
+  # `<WIKI_…>`, etc. — explicit upper-snake placeholder shape.
+  '''<[A-Z][A-Z0-9_]+(:[^>]+)?>''',
+  # Older convention.
+  '''<see Infisical:''',
+]
