@@ -371,23 +371,7 @@ regexes = [
   '''<[A-Z][A-Z0-9_]+(:[^>]+)?>''',
   # Older convention.
   '''<see Infisical:''',
-
-  # Unsigned (`alg:none`) JWT test fixtures. Carried IDENTICALLY by 25 repos as a
-  # per-repo entry before ops #2830; promoted here so a template sync does not
-  # have to re-apply it 25 times, each re-application being a chance to lose it.
-  #
-  # ⚠ IT APPEARS TO SUPPRESS NOTHING, and that is recorded rather than acted on.
-  # Measured 2026-08-14 against gitleaks 8.21.2: with and without this entry,
-  # output was byte-identical across 4 fixtures (unsigned/signed JWTs under
-  # `authorization =` and `api_token =`) and across the 10-canary suite (10/10
-  # both ways). `ha-long-lived-token` requires a third segment of {20,} chars, so
-  # it CANNOT match an unsigned token, whose third segment is empty. An anchored
-  # secret-target variant did not suppress either, so the mechanism is NOT
-  # established -- only that no constructed case changes behaviour.
-  #
-  # It is promoted rather than dropped precisely because it is unproven: keeping
-  # an inert entry costs a line, and removing a suppression that some fixture
-  # somewhere does rely on costs a red gate nobody expected. Removing it should
-  # be a deliberate decision with its own evidence, not a side effect of a sync.
+  # --- repo-local, preserved across template syncs (ops #2830) ---
+  # `eyJ...` JWTs with `alg:none` test fixtures (3 dots literal then trailing).
   '''eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.\s*['"]''',
 ]
