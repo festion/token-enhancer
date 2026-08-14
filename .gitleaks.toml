@@ -371,7 +371,4 @@ regexes = [
   '''<[A-Z][A-Z0-9_]+(:[^>]+)?>''',
   # Older convention.
   '''<see Infisical:''',
-  # --- repo-local, preserved across template syncs (ops #2830) ---
-  # `eyJ...` JWTs with `alg:none` test fixtures (3 dots literal then trailing).
-  '''eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.\s*['"]''',
 ]
