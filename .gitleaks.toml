@@ -24,6 +24,45 @@ useDefault = true
 # ---------------------------------------------------------------------------
 # Custom rules
 # ---------------------------------------------------------------------------
+#
+# ⚠ EVERY RULE BELOW DECLARES `secretGroup = 1`, AND ITS SOLE CAPTURING GROUP IS
+#   THE CREDENTIAL VALUE. Every other group is `(?:...)`. Load-bearing, not style
+#   -- keep it that way when adding a rule. The truenas-api-key rule below
+#   carries the full incident write-up; this is the fleet-wide statement.
+#
+#   gitleaks reports capture group 1 as a finding's secret. In an anchored rule
+#   group 1 is the ANCHOR, so the reported secret was never the credential.
+#   Measured before the fix (ops #2875), one sample per rule:
+#
+#       netbox-api-token      secret = 'netbox_api_token'    <- the field name
+#       pushover-app-token    secret = 'pushover_api_token'  <- the field name
+#       generic-bearer-token  secret = 'Bearer'              <- a keyword
+#       private-key-pem       secret = 'RSA '                <- the algorithm
+#
+#   Four rules reported a constant string as the secret. That is a correctness
+#   bug on its own, and it is what made the inherited default allowlist test
+#   field names instead of credentials.
+#
+#   ⚠ THE TRADE-OFF SPANS FIVE RULES, NOT JUST TRUENAS. secretGroup moves the
+#     stopword test onto the credential. Shape-preserving sweep, every value at
+#     its rule's required length and charset:
+#
+#                             ^true      false(mid)   null$(end)
+#       ha-long-lived-token   fires      SUPPRESSED   SUPPRESSED
+#       anthropic-api-key     fires      SUPPRESSED   SUPPRESSED
+#       truenas-api-key       fires      SUPPRESSED   SUPPRESSED
+#       pushover-app-token    fires      SUPPRESSED   SUPPRESSED
+#       netbox-api-token      fires      fires        fires
+#       generic-bearer-token  SUPPRESSED SUPPRESSED   SUPPRESSED
+#
+#     `^true` bites only generic-bearer -- the others are digit- or
+#     fixed-prefix-led (eyJ, sk-ant-, 1-, [aug]). The UNANCHORED `false` and the
+#     end-anchored `null$` bite five of six; netbox escapes only because 40-hex
+#     cannot spell either word. Shipped deliberately: this MOVES a likely
+#     trigger (a human-chosen anchor word) to an unlikely one (a random
+#     substring in a credential, order 1e-7).
+#
+# ---------------------------------------------------------------------------
 
 [[rules]]
 id = "ha-long-lived-token"
@@ -31,21 +70,24 @@ description = "Home Assistant long-lived access token (JWT with iss claim)"
 # JWTs are header.payload.signature, all base64url. The HA-specific tells are
 # `iss`, `iat`, `exp` claims after a permissive header. Keep the regex narrow
 # enough that arbitrary base64 blobs don't trip it.
-regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{20,}'''
+regex = '''(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{20,})'''
+secretGroup = 1
 keywords = ["eyJ"]
 
 [[rules]]
 id = "proxmox-pve-api-token"
 description = "Proxmox VE API token (`PVEAPIToken=user@realm!tokenid=uuid`)"
 # Token format: PVEAPIToken=user@realm!tokenid=<uuid-secret>
-regex = '''PVEAPIToken=[A-Za-z0-9._@-]+![A-Za-z0-9._-]+=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+regex = '''PVEAPIToken=[A-Za-z0-9._@-]+![A-Za-z0-9._-]+=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'''
+secretGroup = 1
 keywords = ["PVEAPIToken="]
 
 [[rules]]
 id = "pbs-api-token"
 description = "Proxmox Backup Server API token (`PBSAPIToken=user@realm!tokenid:uuid`)"
 # PBS uses `:` as the separator between tokenid and secret (PVE uses `=`).
-regex = '''PBSAPIToken=[A-Za-z0-9._@-]+![A-Za-z0-9._-]+:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+regex = '''PBSAPIToken=[A-Za-z0-9._@-]+![A-Za-z0-9._-]+:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'''
+secretGroup = 1
 keywords = ["PBSAPIToken="]
 
 [[rules]]
@@ -54,20 +96,50 @@ description = "PBS token id with adjacent UUID secret (`monitor@pbs!name:uuid` s
 # Catches the bare-token shape that appeared in proxmox-agent docs / configs:
 #   monitor@pbs!agent:8a14ef79-1a2b-4c5d-...
 # Matches @pbs! plus a UUID v4 within ~80 chars.
-regex = '''[A-Za-z0-9._-]+@pbs![A-Za-z0-9._-]+[:= ]\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+#
+# ⚠ THE SEPARATOR CLASS IS `["'\s:=]+`, NOT `[:= ]\s*`. This rule and its @pve!
+#   twin below carried the latter until 2026-08-14 (ops #2881), and `[:= ]`
+#   matches EXACTLY ONE character while `\s*` then matches whitespace only. So
+#   a single space BEFORE the `=` broke the match: the class ate the space,
+#   `\s*` matched empty, and the engine needed a hex digit where it found `=`.
+#
+#   Measured, one variable (the separator), five values, both realms:
+#
+#       " = "   SILENT      <- ordinary YAML/TOML/ini/shell spacing
+#       "="     fires
+#       ": "    fires
+#       ":"     fires
+#       " "     fires
+#
+#   Four of five fired and the two realms agreed exactly, which is what
+#   established this as the regex rather than a broken harness. `key = value`
+#   is the single most common way these get written down, and it was the one
+#   shape that got through.
+#
+#   `["'\s:=]+` is not a new invention here -- it is the idiom netbox-api-token,
+#   pushover-app-token, truenas-api-key and generic-bearer-token already use in
+#   this same file, which is why none of them had this gap. This change brings
+#   these two rules onto it and widens NOTHING else: the `@pbs!`/`@pve!` prefix
+#   is still required, so a bare UUID still does not match (negative control).
+regex = '''[A-Za-z0-9._-]+@pbs![A-Za-z0-9._-]+["'\s:=]+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'''
+secretGroup = 1
 keywords = ["@pbs!"]
 
 [[rules]]
 id = "pve-token-id-with-uuid-secret"
 description = "PVE token id with adjacent UUID secret (`api@pve!homepage=uuid` shape)"
-regex = '''[A-Za-z0-9._-]+@pve![A-Za-z0-9._-]+[:= ]\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'''
+# Separator class: see the ops #2881 note on the @pbs! twin above. `[:= ]\s*`
+# matched exactly one character and so missed `root@pve!ci = <uuid>` entirely.
+regex = '''[A-Za-z0-9._-]+@pve![A-Za-z0-9._-]+["'\s:=]+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'''
+secretGroup = 1
 keywords = ["@pve!"]
 
 [[rules]]
 id = "netbox-api-token"
 description = "NetBox API token (40 hex chars, often after `Token ` or in a config field)"
 # NetBox tokens are 40 lowercase-hex. Require an anchor word to keep noise low.
-regex = '''(?i)(netbox[_-]?(api[_-]?)?token|netbox.*authorization)["'\s:=]+[a-f0-9]{40}\b'''
+regex = '''(?i)(?:netbox[_-]?(?:api[_-]?)?token|netbox.*authorization)["'\s:=]+([a-f0-9]{40})\b'''
+secretGroup = 1
 keywords = ["netbox"]
 
 [[rules]]
@@ -75,7 +147,8 @@ id = "pushover-app-token"
 description = "Pushover application token (30-char alnum, prefixed with `a`)"
 # Pushover app tokens start with 'a' and are 30 chars total. User keys start
 # with 'u' and are also 30 chars. Anchor on the keyword to avoid noise.
-regex = '''(?i)(pushover[_-]?(api[_-]?)?(token|key))["'\s:=]+[aug][a-zA-Z0-9]{29}\b'''
+regex = '''(?i)(?:pushover[_-]?(?:api[_-]?)?(?:token|key))["'\s:=]+([aug][a-zA-Z0-9]{29})\b'''
+secretGroup = 1
 keywords = ["pushover"]
 
 [[rules]]
@@ -83,13 +156,46 @@ id = "truenas-api-key"
 description = "TrueNAS API key (id-prefixed: `<n>-<60+ alnum>`)"
 # Format: `<numeric_id>-<base64ish-60-chars>`. Anchor on context so we don't
 # false-positive on every dashed identifier.
-regex = '''(?i)(truenas[_-]?(api[_-]?)?key|HOMEPAGE_VAR_TRUENAS_KEY)["'\s:=]+[0-9]+-[A-Za-z0-9]{60,}\b'''
+#
+# ⚠ secretGroup = 1 IS LOAD-BEARING, NOT A TIDY-UP.
+#
+# gitleaks reports CAPTURE GROUP 1 as a finding's secret. Without secretGroup,
+# group 1 here was the anchor alternation -- so the reported "secret" was the
+# literal string `truenas_api_key`, never the credential. gitleaks' inherited
+# default allowlist then tested THAT. Its boolean-literal entry is, verbatim:
+#     (?i)^true|false|null$
+# Alternation binds loosest, so this parses as (?i) (^true) | (false) | (null$)
+# -- NOT the ^(true|false|null)$ its author intended. Three alternatives, three
+# different anchorings. `truenas_api_key` starts with "true", hits ^true, and is
+# suppressed; `HOMEPAGE_VAR_TRUENAS_KEY` starts with "HOMEPAGE" and is not.
+# Verified 2026-08-14 (ops #2875) by reading the pattern out of the 8.21.2 binary
+# and confirming 6/6 against prediction with a controlled-secret probe.
+#
+# Two earlier explanations of this are FALSIFIED; do not reinstate them. It is
+# not "the secret contains `true`" (that holds only for `false`, which really is
+# unanchored), and it is not case-sensitive ((?i) spans the whole pattern).
+#
+# The exposure was not uniform: a HIGH-entropy key still got caught by the
+# built-in `generic-api-key` (mislabelled, but caught), while a LOW-entropy one
+# was detected by NOTHING AT ALL -- generic-api-key is entropy-gated. So the
+# real hole was low-entropy TrueNAS keys behind a lowercase anchor.
+#
+# TRADE-OFF, stated because it is invisible afterwards: secretGroup does not
+# remove this class of risk, it MOVES it. The allowlist now tests the credential
+# instead of the field name. Here that is strictly better -- an anchor is a
+# human-chosen word, exactly what a stopword list matches, which is why this rule
+# was 100% dead rather than unlucky; a value is random, so `false` anywhere or a
+# trailing `null` costs order 1e-7. `^true` cannot reach this rule's value at all
+# (it is digit-led). A likely trigger traded for an unlikely one.
+regex = '''(?i)(?:truenas[_-]?(?:api[_-]?)?key|HOMEPAGE_VAR_TRUENAS_KEY)["'\s:=]+([0-9]+-[A-Za-z0-9]{60,})\b'''
+secretGroup = 1
 keywords = ["truenas", "HOMEPAGE_VAR_TRUENAS_KEY"]
 
 [[rules]]
 id = "private-key-pem"
 description = "Private key PEM block (RSA, EC, OpenSSH, generic)"
-regex = '''-----BEGIN ((RSA|EC|DSA|OPENSSH|PGP) )?PRIVATE KEY( BLOCK)?-----'''
+regex = '''(-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|PGP) )?PRIVATE KEY(?: BLOCK)?-----)'''
+secretGroup = 1
 keywords = ["BEGIN", "PRIVATE KEY"]
 
 [[rules]]
@@ -97,7 +203,8 @@ id = "anthropic-api-key"
 description = "Anthropic API key (`sk-ant-api03-…` and similar version prefixes)"
 # Format: `sk-ant-api<N>-` then ~95 chars base64url. Self-anchored — no
 # keyword needed; the prefix is unique enough not to false-positive.
-regex = '''sk-ant-api\d{2,}-[A-Za-z0-9_-]{90,}'''
+regex = '''(sk-ant-api\d{2,}-[A-Za-z0-9_-]{90,})'''
+secretGroup = 1
 keywords = ["sk-ant-api"]
 
 [[rules]]
@@ -106,7 +213,8 @@ description = "Generic bearer / authorization with long secret"
 # Loose match for `Authorization: Bearer <60+ chars>` or `auth_token = <secret>`.
 # `\b` prefix prevents matches on camelCase identifiers like `authenticateApiKey`
 # (no word boundary inside camelCase). Keyword list reduces noise further.
-regex = '''(?i)\b(authorization|bearer|api[_-]?token|api[_-]?key|access[_-]?token)["'\s:=]+[A-Za-z0-9._\-]{40,}\b'''
+regex = '''(?i)\b(?:authorization|bearer|api[_-]?token|api[_-]?key|access[_-]?token)["'\s:=]+([A-Za-z0-9._\-]{40,})\b'''
+secretGroup = 1
 keywords = ["authorization", "bearer", "api_token", "api-token", "apikey", "api_key", "access_token"]
 
 # ---------------------------------------------------------------------------
@@ -159,6 +267,13 @@ paths = [
   '''(^|/)tests?/''',
   '''(^|/)__tests__/''',
   '''(^|/)spec/''',
+  # Go puts tests in a FILE SUFFIX beside the code, not in a directory, so the
+  # three entries above never fire in a Go repo (ops #2837). Measured on
+  # birdnet-gone: 9 of its 14 non-bulk findings were Go test fixtures.
+  # TRADE-OFF, stated rather than buried: a real credential committed in a
+  # _test.go file is no longer detected. That is the same trade the directory
+  # entries above already make for every other language.
+  '''_test\.go$''',
   '''(^|/)\.jest-cache[^/]*/''',                # Jest transform / haste-map caches
   '''\.pkl$''',                                # pickle binaries (Serena)
   '''\.log$''',                                # log files
@@ -171,8 +286,16 @@ paths = [
 ]
 
 # Stop matches that are obviously placeholder / docs / test fixtures.
-# Each entry is a regex that, if it matches the LINE (not just the match),
-# suppresses the finding.
+#
+# ⚠ Each entry is matched against the CAPTURED SECRET, not against the line.
+#   No `regexTarget` is set, and gitleaks defaults to the secret. A previous
+#   version of this comment said "the LINE (not just the match)", which is
+#   wrong and is an expensive kind of wrong: an entry written to match the
+#   surrounding line silently suppresses NOTHING -- no error, no warning, the
+#   finding simply keeps firing. Measured 2026-08-12 (ops #2837) while
+#   allowlisting a PEM placeholder: a line-shaped entry left the finding count
+#   unchanged, and only re-scanning revealed it. Anchor entries to the value
+#   (`^...$`), not to its context.
 regexes = [
   # Test-fixture UUIDs (zero-uuid, all-f-uuid).
   '''00000000-0000-0000-0000-000000000000''',
@@ -190,12 +313,41 @@ regexes = [
   '''\b(MY_|FAKE_|DUMMY_|PLACEHOLDER_|TEST_|EXAMPLE_)(TOKEN|KEY|API_KEY|PASSWORD|SECRET)\b''',
   # Bare `PASSWORD` / `TOKEN` etc. in shell-quoted creds: `-u "root:PASSWORD"`.
   '''[':"]\s*(USERNAME|USER|PASSWORD|PASS|TOKEN|KEY|SECRET)\s*[':"]''',
+  # The same placeholder UNQUOTED, which the entry above cannot reach: it
+  # requires a quote character on both sides, and `curl -s -u USER:PASS` has
+  # neither. Measured 2026-08-13 on homelab-workspace (ops #2830): 3 findings,
+  # all the 9-byte literal `USER:PASS` in docs. Anchored and enumerated, so it
+  # suppresses only these exact placeholder words.
+  '''^(USER|USERNAME):(PASS|PASSWORD)$''',
+  # Credentials supplied by SHELL COMMAND SUBSTITUTION, which is the pattern
+  # this org's docs are supposed to use: `curl -u "admin:$(infisical-get X)"`.
+  # The captured value contains no credential material at all — it is a
+  # command that fetches one at runtime — so a finding here is a pure false
+  # positive, and one that punishes the correct pattern. Measured 2026-08-13
+  # on homelab-workspace (ops #2830): 6 of its 11 findings were this shape in
+  # docs/network/ADGUARD_DNS_UPDATE_PROCEDURES.md, and a previous triage had
+  # recorded them as "the dead AdGuard credential pair" (ops #2839) — they are
+  # not a credential pair at all.
+  # Fail direction: a literal secret cannot match, because the value must both
+  # begin with `$(` after the colon and end with `)`. Anchored at both ends.
+  '''^[A-Za-z_][A-Za-z0-9_.-]*:\$\([^)]+\)$''',
   # Truncated-with-ellipsis JWT/Infisical placeholders in docs.
   # `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` — canonical HS256 JWT header,
   # ellipsis-truncated. Same pattern handles other JWT placeholders.
   '''eyJ[A-Za-z0-9_-]+\.\.\.''',
-  # `eyJ...` JWTs with `alg:none` test fixtures (3 dots literal then trailing).
-  '''eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.\s*['"]''',
+  # Unsigned JWTs -- `alg:none` attack fixtures, whose signature segment is
+  # EMPTY. A JWT with no signature cannot authenticate anything, so it is not a
+  # credential whatever its claims say. A properly signed JWT is unaffected and
+  # still reported (verified with a control).
+  #
+  # ANCHORED TO THE CAPTURED VALUE. The previous form ended `\.\s*['"]`, i.e.
+  # it required a quote character that is NOT part of the capture -- gitleaks
+  # matches allowlist regexes against the captured secret, not the line, so it
+  # could never fire. Measured 2026-08-13 on festion/prompter: the entry was
+  # present and the finding was reported anyway; the regex matched the line and
+  # not the secret. That is ops #2837's correction exactly, and the warning
+  # against writing line-shaped entries is 20 lines above this one.
+  '''^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.$''',
   # Infisical service token placeholder (`st.<uuid>...` or `st.your-token`).
   '''st\.[0-9a-f-]{0,36}\.\.\.''',
   '''st\.your-token''',
