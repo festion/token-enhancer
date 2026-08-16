@@ -4,8 +4,25 @@
 # Author: Task 22 (Vikunja #1073).
 #
 # Each repo's `.gitleaks.toml` is a verbatim copy of this file.
-# To update centrally: edit `operations/templates/gitleaks/.gitleaks.toml`,
-# then re-roll via the per-repo procedure in the README.
+#
+# TO UPDATE CENTRALLY: edit this file and merge. The fan-out is AUTOMATED as of
+# ops #2958 — homelab-iac's weekly `gitleaks-fleet-sync-watch.py` surveys every
+# gated repo and opens a sync PR on each one that has fallen behind. It opens
+# PRs and merges nothing, so the review gate is unchanged, and it skips a repo
+# that already has one open, so an unmerged PR is not reopened weekly.
+#
+# Do NOT hand-copy this file into a repo. `sync_gitleaks_fleet.py` performs a
+# MERGE, not a copy: repo-local allowlist entries (ESPHome's CI dummy key,
+# gw4-config-tool's cert fixture, four in birdnet-gone) are preserved with their
+# comments. A `cp` deletes them, and the symptom is that repo's CI going red on
+# a known-safe fixture — which is the pressure that gets a gate disabled.
+#
+# Until ops #2958 the fan-out was manual and it decayed twice in three days:
+# ops #2881 fixed two rules here and every copy kept the gap; ops #2874 moved
+# the anthropic floor and 23 of 32 repos were still blind the next morning.
+# A stale detector fails in the reassuring direction — gitleaks exits 0, CI is
+# green, and "no leaks found" means "none of the kinds this copy still knows
+# about". That is why the fan-out is scheduled rather than remembered.
 #
 # Rule shapes are tuned to the literals found in the 2026-05-08 audit:
 #   - HA long-lived JWTs (eyJ... with iss/iat/exp claims)
