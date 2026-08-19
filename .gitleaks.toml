@@ -426,3 +426,189 @@ regexes = [
   # Older convention.
   '''<see Infisical:''',
 ]
+
+# ---------------------------------------------------------------------------
+# Markdown-table shapes (ops #3063)
+# ---------------------------------------------------------------------------
+#
+# ⚠ WHY THESE EXIST. A markdown table separates a label from its value with
+#   `|`. Upstream's `generic-api-key` -- the rule carrying every credential with
+#   no distinctive prefix -- requires label and value to be joined by `:` or
+#   `=`. So in a table the label is present, adjacent, and unreachable.
+#   Measured 2026-08-19: one identical 30-char alnum value, 8 line formats, one
+#   scan, this config with `useDefault = true`. Exactly one thing varied.
+#
+#       - api_key: V                            CAUGHT   generic-api-key
+#       api_key=V                               CAUGHT
+#       - api_key: `V`                          CAUGHT
+#       api_key: V              (yaml)          CAUGHT
+#       | api_key: V | note |   (colon INSIDE)  CAUGHT
+#       | api_key | `V` |       (md table)      MISSED
+#       | api_key | V |         (md table)      MISSED
+#       V                       (bare)          MISSED
+#
+#   Put a colon back inside the cell and detection returns -- same value, same
+#   file, same rule. The separator is the whole discriminator.
+#
+#   A markdown table is how a human writes a credential inventory, so this is
+#   the layout of the document you least want leaking. It is also the SECOND
+#   independent instrument found blind to it: ops #2831's hand-written parser
+#   missed "a 23-char punctuation-rich password in a markdown table row" and was
+#   widened from 4 value slots to 98. Two tools, two authors, one blind spot --
+#   a property of the shape, not of anyone's regex.
+#
+#   Scope, stated because it is easy to over-read: `generic-api-key` is an
+#   UPSTREAM DEFAULT. This is not a defect the operations template introduced
+#   and no template sync caused it. These rules are an ADDITION. Prefixed rules
+#   never had the gap -- the `sk-ant-` canary was caught in all three formats
+#   including the table cell, because a prefix rule needs no label. The gap is
+#   scoped to keyword-anchored generic rules, i.e. exactly the class covering
+#   vendor passwords, DB passwords and app passwords.
+#
+# ⚠ THE TWO SUB-SHAPES ARE DIFFERENT PROBLEMS AND ONE RULE CANNOT COVER BOTH.
+#
+#     A  key/value table   `| api_key | V |`                 label ADJACENT
+#     B  column-header     `| Service | User | Password |`    label in HEADER
+#                          `| vw | admin | V |`               value in a row
+#
+#   `| Service | User | Password |` is the single most likely credential-table
+#   layout, and a rule anchored on cell adjacency cannot see it at all -- the
+#   cell left of the value holds `admin`. Both were MISSED before these rules
+#   and both are CAUGHT after. A one-rule fix covers the LESS likely half and
+#   reads as complete, which is why B exists separately.
+#
+# ⚠ BOTH DECLARE `secretGroup = 1` AND GROUP 1 IS THE CREDENTIAL, per the
+#   fleet-wide statement at the top of this file. Asserted, not assumed: both
+#   rules were run against a synthetic canary and the reported `.Secret` digest
+#   compared to the canary's -- equal for both; the same value plus one
+#   character produced a different digest in the same run, so "equal" is a
+#   measurement. (ops #2875 is the incident where four rules reported a constant
+#   field name as the secret.)
+#
+# ⚠ RULE B REPORTS THE HEADER LINE, NOT THE VALUE LINE. It is a multi-line match
+#   and gitleaks anchors a finding at the START of the match. Two operational
+#   consequences: a triage that opens the reported line finds a column header
+#   and no secret; and a per-line `# gitleaks:allow` opt-out must go on the
+#   HEADER row to silence it, not on the row holding the value. Measured -- the
+#   StartLine was the header in all three B cases.
+#
+# ⚠ RULE B CATCHES THE FIRST DATA ROW OF A TABLE, NOT EVERY ROW. gitleaks
+#   reports non-overlapping matches and each match consumes the header it needed
+#   for context, so a 40-row credential table yields ~1 finding, not 40.
+#   Deliberate and sufficient for what this config IS -- a commit gate, where
+#   one finding blocks the commit. It is NOT sufficient as an inventory tool:
+#   do not read its finding count as a credential count.
+#
+# ⚠ `(?m)` IS LOAD-BEARING IN RULE B. Without it Go RE2 makes `$` mean
+#   end-of-TEXT, the trailing anchor can only match at the very end of a file,
+#   and the rule silently never fires. It was drafted that way and the symptom
+#   was a clean scan -- the reassuring direction, as always.
+#
+# ⚠ `^[ \t]{0,3}\|` IS ALSO LOAD-BEARING, AND IT BROKE RULE B ONCE. A real
+#   markdown table row starts with `|` at line start; requiring that is what
+#   stops the rules matching REGEX ALTERNATION (`|~ "requestCSRFToken|X|Y"` in a
+#   LogQL query was a measured fleet false positive -- pipes, no table). But
+#   anchoring rule B at `^` initially forced the keyword into the FIRST cell,
+#   so `| Service | User | Password |` stopped matching and all three B cases
+#   silently went MISSED. Hence `(?:[^\n|]*\|)*?` -- skip whole leading cells.
+#   Keep both, and re-run the case matrix if either is touched.
+#
+# ⚠ THE 16-CHARACTER FLOOR IS THE FAMILY DEFECT RESTATED, NOT SOLVED. The
+#   always-loaded safety rules record that a length floor admits every
+#   credential shorter than it -- a 16-char Gmail app password, an 8-char WiFi
+#   PSK, a PIN. Measured at this floor: a 15-char high-entropy value in a
+#   password cell is MISSED, a 16-char one CAUGHT. The floor buys tolerable
+#   noise in prose-heavy markdown; it does not buy coverage.
+#
+# ⚠ ENTROPY 3.0 IS A NOISE FLOOR, NOT A CLASSIFIER -- AND RAISING IT WOULD COST
+#   MORE THAN IT SAVED. Measured in both directions: a 16-char repeated
+#   character (entropy 0) in a `| password |` cell is SUPPRESSED; a 16-char
+#   random one FIRES; a weak dictionary password (`changeme12345678`, 3.875)
+#   FIRES, deliberately, because a weak real password is still a leaked one.
+#   But the five real fleet false positives measured 3.155 .. 4.127 while
+#   realistic credential shapes measured 3.875 .. 5.459 -- THE RANGES OVERLAP.
+#   A 49-char absolute file path (4.127) out-scores a 40-hex API token (3.971).
+#   So no entropy floor separates them, and any floor high enough to drop the
+#   paths drops real tokens first. That is why the suppression below is
+#   STRUCTURAL rather than another threshold.
+#
+# FALSE-POSITIVE BASIS. Full sweep of 22 gated working trees, seeded
+# known-positive asserted present (a sweep that silently scans nothing produces
+# the same clean zero as a clean fleet -- and gitleaks exits 0 with "no leaks
+# found" on a --source that does not exist, measured; see ops #3065). Before
+# suppression: 5 distinct sites, all false positives, in three classes -- an
+# absolute PATH in the value cell (2), an UPPER_SNAKE env-var NAME in the value
+# cell (2), and the LogQL alternation above (1). Benign tables of versions,
+# IPv4 addresses, ports, prose and 40-char commit SHAs produced zero throughout.
+#
+# THE ALLOWLISTS BELOW ARE PER-RULE, NOT GLOBAL. Both entries would be defensible
+# fleet-wide, and both would silently weaken every other rule if put there -- an
+# UPPER_SNAKE suppression in `[allowlist]` also applies to `generic-api-key`.
+# Scoping them to these two rules bounds the blast radius to the rules whose
+# false positives were actually measured. Each is anchored to the CAPTURED
+# SECRET (`^...$`), per the warning above the global `regexes` list: an entry
+# written against the surrounding line suppresses NOTHING, with no error
+# (ops #2837).
+#
+# Fail direction, stated: a real credential that is exactly an absolute path
+# with a dotted extension, or exactly an UPPER_SNAKE identifier, is now missed
+# by these two rules. A base64 secret can begin with `/`, so the path entry is
+# not impossible to collide with -- it additionally requires every `/`-delimited
+# segment to be non-empty, no `+` or `=` anywhere, and a trailing `.ext`, which
+# a base64 blob satisfies rarely. The UPPER_SNAKE entry requires at least one
+# underscore, which generated tokens (mixed-case or hex) do not have.
+# Both were fire-tested in BOTH directions: each shape FIRES with the allowlist
+# removed and is SUPPRESSED with it present, in the same run, while the true
+# positives above keep firing in both arms.
+
+[[rules]]
+id = "md-table-keyvalue-secret"
+description = "Credential in a two-column markdown table row (`| api_key | <value> |`)"
+# FLOOR: {16,} admits every credential shorter than 16 chars -- WiFi PSKs (8),
+#   PINs, short DB passwords -- and 16 is itself the length of a Gmail app
+#   password, so this rule sits exactly ON the boundary that ops #2833/#2861
+#   were leaked through. Measured at this floor: a 15-char high-entropy value
+#   in a `| password |` cell is MISSED, a 16-char one CAUGHT. The short set is
+#   covered by parse-and-strip and by the entropy scanner over agent-written
+#   trees, NOT by this threshold. Lowering it is not the fix -- it would bury
+#   prose-heavy markdown in noise, and noise is how a gate gets disabled.
+regex = '''(?im)^[ \t]{0,3}\|[ \t]*`?[^|\n`]{0,60}(?:password|passwd|secret|token|api[ _-]?key|apikey|access[ _-]?key|private[ _-]?key|credential|passphrase|psk)[^|\n`]{0,60}`?[ \t]*\|[ \t]*`?([A-Za-z0-9+/=_.\-]{16,})`?[ \t]*\|'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["password", "passwd", "secret", "token", "api key", "api_key", "api-key", "apikey", "access key", "access_key", "private key", "private_key", "credential", "passphrase", "psk"]
+
+[rules.allowlist]
+description = "Measured false-positive shapes for md-table-keyvalue-secret (ops #3063)"
+regexes = [
+  # An absolute path with a dotted extension: `/config/esphome/secrets.yaml`,
+  # `/home/dev/dotfiles/.claude/hooks/block-secrets.py`. Both measured on the
+  # fleet; the label cell said "secrets" and the value cell was a filename.
+  '''^/(?:[A-Za-z0-9_.@-]+/)+[A-Za-z0-9_.@-]+\.[A-Za-z0-9]{1,8}$''',
+  # An UPPER_SNAKE identifier: `PUSHOVER_APP_TOKEN`, `DASHBOARD_PASSWORD`.
+  # These come from name-to-name mapping tables (Infisical key -> .env var),
+  # where BOTH cells are variable names and neither is a value.
+  '''^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$''',
+]
+
+[[rules]]
+id = "md-table-column-secret"
+description = "Credential under a secret-named column of a markdown table (value in the last cell)"
+# FLOOR: {16,} admits every credential shorter than 16 chars -- WiFi PSKs (8),
+#   PINs, short DB passwords -- and 16 is itself the length of a Gmail app
+#   password, so this rule sits exactly ON the boundary that ops #2833/#2861
+#   were leaked through. Measured at this floor: a 15-char high-entropy value
+#   in a `| password |` cell is MISSED, a 16-char one CAUGHT. The short set is
+#   covered by parse-and-strip and by the entropy scanner over agent-written
+#   trees, NOT by this threshold. Lowering it is not the fix -- it would bury
+#   prose-heavy markdown in noise, and noise is how a gate gets disabled.
+regex = '''(?im)^[ \t]{0,3}\|(?:[^\n|]*\|)*?[^\n|]{0,60}(?:password|passwd|secret|token|api[ _-]?key|apikey|access[ _-]?key|private[ _-]?key|credential|passphrase|psk)[^\n|]{0,20}\|[ \t]*\n[ \t]{0,3}\|[-: |\t]+\|[ \t]*\n(?:[ \t]{0,3}\|[^\n]*\|[ \t]*\n){0,3}?[ \t]{0,3}\|[^\n]*\|[ \t]*`?([A-Za-z0-9+/=_.\-]{16,})`?[ \t]*\|[ \t]*$'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["password", "passwd", "secret", "token", "api key", "api_key", "api-key", "apikey", "access key", "access_key", "private key", "private_key", "credential", "passphrase", "psk"]
+
+[rules.allowlist]
+description = "Measured false-positive shapes for md-table-column-secret (ops #3063)"
+regexes = [
+  '''^/(?:[A-Za-z0-9_.@-]+/)+[A-Za-z0-9_.@-]+\.[A-Za-z0-9]{1,8}$''',
+  '''^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$''',
+]
