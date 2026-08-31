@@ -584,9 +584,16 @@ regexes = [
   # `/home/dev/dotfiles/.claude/hooks/block-secrets.py`. Both measured on the
   # fleet; the label cell said "secrets" and the value cell was a filename.
   '''^/(?:[A-Za-z0-9_.@-]+/)+[A-Za-z0-9_.@-]+\.[A-Za-z0-9]{1,8}$''',
-  # An UPPER_SNAKE identifier: `PUSHOVER_APP_TOKEN`, `DASHBOARD_PASSWORD`.
+  # An UPPER_SNAKE identifier: `VIKUNJA_API_TOKEN`, `DASHBOARD_PASSWORD`.
   # These come from name-to-name mapping tables (Infisical key -> .env var),
   # where BOTH cells are variable names and neither is a value.
+  # Keep these examples on LIVE key names. The first one used to name a
+  # credential retired by ops #2953, and homelab-iac's guard forbids that
+  # spelling in ANY tracked file -- so this template carried, into every
+  # synced repo, a name the fleet had agreed to stop using, and reddened an
+  # unrelated sync PR (homelab-iac#783) months later. The retired spelling is
+  # deliberately not quoted here: that guard's own docstring records it being
+  # defeated once by documentation that spelled out the very name it banned.
   '''^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$''',
 ]
 
